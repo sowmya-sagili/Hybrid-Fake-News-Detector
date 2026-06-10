@@ -27,7 +27,14 @@ def render_analyze_page(pipe, sensitivity, db, has_enhanced_features, gemini_ver
     
     if st.button('🔍 Analyze', use_container_width=True):
         if not pipe:
-            st.error('❌ Model not loaded. Please refresh the page or train the model.')
+            st.error(
+                "❌ **Model not loaded.**\n\n"
+                "The ML model files (`models/model.joblib` and `models/tfidf.joblib`) "
+                "are missing or failed to load.\n\n"
+                "**Fix:** Open a terminal in the project folder and run:\n"
+                "```\npython train_model.py\n```\n"
+                "Then refresh this page. The startup error above (if any) contains the exact reason."
+            )
         elif text.strip():
             with st.spinner('Analyzing...'):
                 # Translate if requested

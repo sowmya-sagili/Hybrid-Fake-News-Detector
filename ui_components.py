@@ -42,10 +42,10 @@ def render_api_status(gnews_ok, gnews_msg, has_gemini):
     st.sidebar.subheader('🌐 API Status')
     
     if gnews_ok:
-        st.sidebar.success('✅ GNews API: Active')
+        st.sidebar.success('✅ Web Search API: Active')
         st.sidebar.caption(gnews_msg)
     else:
-        st.sidebar.warning('⚠️ GNews API: Issue')
+        st.sidebar.warning('⚠️ Web Search API: Issue')
         st.sidebar.caption(gnews_msg)
     
     if has_gemini:

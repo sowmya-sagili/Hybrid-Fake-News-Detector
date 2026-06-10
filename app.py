@@ -1,11 +1,29 @@
 import streamlit as st
 import json
 import os
-from joblib import load
-import requests
+import sys
+import logging
+import traceback
+from pathlib import Path
 import re
 import numpy as np
-from sklearn.base import BaseEstimator, ClassifierMixin
+
+# ── Logging: always visible in terminal ──────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+log = logging.getLogger("fake_news_app")
+
+# ── joblib / sklearn safe import ─────────────────────────────────────────────
+try:
+    from joblib import load
+    from sklearn.base import BaseEstimator, ClassifierMixin
+except ImportError as _ie:
+    st.error(f"❌ Missing required packages: {_ie}\n\n"
+             "Run: `.venv/bin/python -m pip install scikit-learn joblib`")
+    st.stop()
 
 # Import new modules
 from ui_components import render_header, render_sidebar_metrics, render_api_status
@@ -13,6 +31,7 @@ from state_management import init_session_state
 from app_pages.analyze_page import render_analyze_page
 from app_pages.batch_page import render_batch_page
 from app_pages.dashboard_page import render_dashboard_page
+from app_pages.info_page import render_info_page
 from api_client import check_gnews_api, gemini_verify_claim, search_news_gnews, translate_text
 
 # Import utils and features
@@ -22,11 +41,14 @@ except ImportError:
     st.error("❌ Critical Error: utils.py not found. Please ensure all files are present.")
     st.stop()
 
-# Configuration
-MODEL_PATH = 'models/pipeline.joblib'
-CONFIG_PATH = 'models/config.json'
+# ── Resolve paths relative to this file so they work regardless of CWD ──────
+_HERE = Path(__file__).parent.resolve()
+MODELS_DIR  = _HERE / "models"
+MODEL_PATH  = MODELS_DIR / "pipeline.joblib"
+CONFIG_PATH = MODELS_DIR / "config.json"
+
 # NOTE: In production, use st.secrets or environment variables
-GNEWS_API_KEY = "84750e988d2d3e69c1c5e94293393433"
+GNEWS_API_KEY  = "84750e988d2d3e69c1c5e94293393433"
 GEMINI_API_KEY = "AIzaSyBa8Txd9gDph1tMP4h7A8iNkWiNN5UrQ3Q"
 
 # Initialize optional features
@@ -67,49 +89,94 @@ class FinalModel(BaseEstimator, ClassifierMixin):
 
 @st.cache_resource
 def load_model():
-    try:
-        # Try loading newest model format (model.joblib + tfidf.joblib)
-        if os.path.exists('models/model.joblib') and os.path.exists('models/tfidf.joblib'):
-            vectorizer = load('models/tfidf.joblib')
-            model = load('models/model.joblib')
-            pipe = FinalModel(vectorizer=vectorizer, model=model)
-            
-            if os.path.exists('models/config.json'):
-                with open('models/config.json') as f:
-                    config = json.load(f)
-            else:
-                config = {}
-            return pipe, 0.5, config
-            
-        # Fallback to optimized model
-        elif os.path.exists('models/pipeline_optimized.joblib'):
-            model_data = load('models/pipeline_optimized.joblib')
-            if isinstance(model_data, dict) and 'vectorizer' in model_data:
+    """
+    Attempt to load the saved model files.  All errors are logged to the
+    terminal AND surfaced to the Streamlit UI instead of being silently swallowed.
+    """
+    model_joblib  = MODELS_DIR / "model.joblib"
+    tfidf_joblib  = MODELS_DIR / "tfidf.joblib"
+    opt_joblib    = MODELS_DIR / "pipeline_optimized.joblib"
+    cfg_json      = MODELS_DIR / "config.json"
+
+    log.info("load_model() called.")
+    log.info(f"  models dir   : {MODELS_DIR}")
+    log.info(f"  model.joblib : {model_joblib} | exists={model_joblib.exists()}")
+    log.info(f"  tfidf.joblib : {tfidf_joblib} | exists={tfidf_joblib.exists()}")
+    log.info(f"  config.json  : {cfg_json}     | exists={cfg_json.exists()}")
+
+    def _load_config(path):
+        if path.exists():
+            with open(path) as f:
+                return json.load(f)
+        return {}
+
+    # ── Try 1: model.joblib + tfidf.joblib (primary format) ─────────────────
+    if model_joblib.exists() and tfidf_joblib.exists():
+        try:
+            log.info("Attempting to load model.joblib + tfidf.joblib …")
+            vectorizer = load(str(tfidf_joblib))
+            model      = load(str(model_joblib))
+            pipe       = FinalModel(vectorizer=vectorizer, model=model)
+            config     = _load_config(cfg_json)
+            log.info("✅ Model loaded successfully (model.joblib + tfidf.joblib).")
+            return pipe, float(config.get("threshold", 0.5)), config
+        except Exception as exc:
+            tb = traceback.format_exc()
+            log.error(f"❌ Failed loading model.joblib / tfidf.joblib:\n{tb}")
+            st.error(
+                f"**Model files found but could not be loaded.**\n\n"
+                f"```\n{tb}\n```\n\n"
+                f"This usually means the model was trained with a different "
+                f"version of scikit-learn/joblib. Run `python train_model.py` to retrain."
+            )
+            return None, 0.5, {}
+
+    # ── Try 2: pipeline_optimized.joblib (legacy format) ────────────────────
+    if opt_joblib.exists():
+        try:
+            log.info("Attempting to load pipeline_optimized.joblib …")
+            model_data = load(str(opt_joblib))
+            if isinstance(model_data, dict) and "vectorizer" in model_data:
                 pipe = FinalModel(
-                    vectorizer=model_data['vectorizer'],
-                    model=model_data['model']
+                    vectorizer=model_data["vectorizer"],
+                    model=model_data["model"]
                 )
             else:
                 pipe = model_data
-            
-            if os.path.exists('models/config.json'):
-                with open('models/config.json') as f:
-                    config = json.load(f)
-            else:
-                config = {}
-            return pipe, 0.5, config
-            
-        elif os.path.exists(MODEL_PATH):
-            pipe = load(MODEL_PATH)
-            with open(CONFIG_PATH) as f:
-                config = json.load(f)
-            return pipe, 0.5, config
-        else:
+            config = _load_config(cfg_json)
+            log.info("✅ Model loaded successfully (pipeline_optimized.joblib).")
+            return pipe, float(config.get("threshold", 0.5)), config
+        except Exception as exc:
+            tb = traceback.format_exc()
+            log.error(f"❌ Failed loading pipeline_optimized.joblib:\n{tb}")
+            st.error(f"**Legacy model failed to load.**\n\n```\n{tb}\n```")
             return None, 0.5, {}
-            
-    except Exception as e:
-        st.error(f"❌ Error loading model: {str(e)}")
-        return None, 0.5, {}
+
+    # ── Try 3: pipeline.joblib (original format) ─────────────────────────────
+    if MODEL_PATH.exists():
+        try:
+            log.info("Attempting to load pipeline.joblib …")
+            pipe   = load(str(MODEL_PATH))
+            config = _load_config(cfg_json)
+            log.info("✅ Model loaded successfully (pipeline.joblib).")
+            return pipe, float(config.get("threshold", 0.5)), config
+        except Exception as exc:
+            tb = traceback.format_exc()
+            log.error(f"❌ Failed loading pipeline.joblib:\n{tb}")
+            st.error(f"**pipeline.joblib failed to load.**\n\n```\n{tb}\n```")
+            return None, 0.5, {}
+
+    # ── No model files found ─────────────────────────────────────────────────
+    missing = [str(p) for p in [model_joblib, tfidf_joblib] if not p.exists()]
+    msg = (
+        f"**No model files found.** Missing: `{', '.join(missing)}`\n\n"
+        f"**To fix, run the trainer from the project folder:**\n"
+        f"```\npython train_model.py\n```\n\n"
+        f"This will create `models/model.joblib` and `models/tfidf.joblib`."
+    )
+    log.error("❌ " + msg.replace("**", "").replace("`", "").replace("\n", " "))
+    st.error(msg)
+    return None, 0.5, {}
 
 # --- Main Application ---
 
@@ -134,12 +201,25 @@ if dark_mode:
     st.markdown("""
     <style>
         .stApp {
-            background-color: #0E1117;
+            background-color: #000000;
             color: #FAFAFA;
         }
         .stTextArea textarea {
             background-color: #262730;
             color: #FAFAFA;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown("""
+    <style>
+        .stApp {
+            background-color: #FFFFFF;
+            color: #000000;
+        }
+        .stTextArea textarea {
+            background-color: #F0F2F6;
+            color: #000000;
         }
     </style>
     """, unsafe_allow_html=True)
@@ -152,8 +232,6 @@ pipe, threshold, cfg = load_model()
 
 # Sidebar
 with st.sidebar:
-    render_sidebar_metrics(cfg)
-    
     # Check API status
     ok, msg, details = check_gnews_api(GNEWS_API_KEY)
     render_api_status(ok, msg, HAS_GEMINI)
@@ -168,8 +246,33 @@ with st.sidebar:
         if st.button('📜 View History', use_container_width=True):
             st.session_state['show_history'] = True
 
+if st.session_state.get('show_history', False):
+    import streamlit.components.v1 as components
+    components.html("""
+    <script>
+    const tabs = window.parent.document.querySelectorAll('button[data-baseweb="tab"]');
+    for (let i = 0; i < tabs.length; i++) {
+        if (tabs[i].innerText.includes('Dashboard')) {
+            tabs[i].click();
+            break;
+        }
+    }
+    setTimeout(() => {
+        const headers = window.parent.document.querySelectorAll('h3');
+        for (let i = 0; i < headers.length; i++) {
+            if (headers[i].innerText.includes('Recent Analyses')) {
+                headers[i].scrollIntoView({behavior: 'smooth', block: 'start'});
+                break;
+            }
+        }
+    }, 200);
+    </script>
+    """, height=0)
+    st.session_state['show_history'] = False
+
 # Main Tabs
 tab1, tab2, tab3, tab4 = st.tabs(['🔍 Analyze', '📦 Batch Upload', 'ℹ️ Info', '📊 Dashboard'])
+
 
 with tab1:
     # Pass API keys implicitly via bound functions or explicit args
@@ -184,20 +287,7 @@ with tab2:
     render_batch_page(pipe, db)
 
 with tab3:
-    st.markdown("""
-    ### About
-    This Hybrid Fake News Detector uses a 5-model ensemble (Logistic Regression, Random Forest, etc.) trained on 59,000+ articles.
-    
-    It combines:
-    1. **ML Analysis**: Statistical text analysis
-    2. **AI Verification**: Google Gemini AI for logic and fact-checking
-    3. **Web Search**: Real-time cross-referencing with GNews
-    
-    ### How to use
-    - Paste a full article in the **Analyze** tab
-    - Upload a CSV in the **Batch Upload** tab
-    - View statistics in the **Dashboard** tab
-    """)
+    render_info_page()
 
 with tab4:
     render_dashboard_page(db)
